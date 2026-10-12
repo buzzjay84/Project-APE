@@ -1,0 +1,239 @@
+name: Build Release from private source
+
+# Lives in the PUBLIC release repo (buzzjay84/Project-APE) as
+# .github/workflows/build-from-private.yml. A copy is kept in the private
+# source at .github/release-repo/build-from-private.yml. Actions on a public
+# repository are free, so the installers are built here. The private source
+# (jaybhee84/Project-APE) is checked out read-only with a deploy key, tested, built,
+# and the installers are published to THIS repo's Releases.
+#
+# Started by watch-private.yml when the private source's version changes, or
+# by hand:
+#   gh workflow run build-from-private.yml -R buzzjay84/Project-APE -f tag=v1.0.1 -f ref=main
+#
+# One tag, one release (as in Tax-E): create-release makes a single draft
+# release first; the Windows, macOS Intel and macOS Apple Silicon builds run in
+# parallel and each uploads its own files into that same release, whichever
+# finishes first; publish-release makes it public only after all succeed.
+#
+# macOS: each architecture is built on its own runner from a fresh checkout,
+# so node_modules (and the encrypted SQLite driver, a native module) is never
+# shared between architectures. Before the DMG is uploaded, `lipo` and `file`
+# must show the Electron executable and better_sqlite3.node built for the
+# same, expected architecture, or the build fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release to publish, e.g. v1.0.0 (must equal package.json version at ref)'
+        required: true
+        type: string
+      ref:
+        description: 'Branch, tag or commit of the private source to build (default: the tag)'
+        required: false
+        type: string
+  repository_dispatch:
+    types: [build-release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.event.inputs.tag || github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: jaybhee84/Project-APE
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+  SOURCE_REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || github.event.inputs.tag || github.event.client_payload.tag }}
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag must look like vX.Y.Z
+        shell: bash
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$RELEASE_TAG' is not a release tag like v1.0.0" >&2
+            exit 1
+          fi
+
+  create-release:
+    needs: check-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the one draft release all builds upload into
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
+            echo "::error::$RELEASE_TAG is already published; bump the version for a new release." >&2
+            exit 1
+          elif gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Draft release $RELEASE_TAG exists; the builds will upload into it."
+          else
+            gh release create "$RELEASE_TAG" --repo "${{ github.repository }}" --draft --title "${RELEASE_TAG#v}" --notes ""
+          fi
+
+  build-windows:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      # Read-only deploy key for the private repo. The key is never printed and no credentials are
+      # left in the workspace. Logs of a public repo are public, so nothing here echoes source.
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify tag matches package version
+        shell: pwsh
+        run: |
+          $packageVersion = (Get-Content package.json | ConvertFrom-Json).version
+          if ($env:RELEASE_TAG -ne "v$packageVersion") {
+            throw "Tag $env:RELEASE_TAG must match package.json version $packageVersion."
+          }
+
+      - run: npm ci
+      - run: npm test
+
+      - name: Build Windows installer
+        run: npm run dist:win
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" release/ape-setup-*.exe release/ape-setup-*.exe.blockmap release/latest.yml --repo "${{ github.repository }}" --clobber
+
+  build-macos:
+    needs: create-release
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Apple Silicon (M1–M5): built natively on an arm64 runner.
+          - arch: arm64
+            runner: macos-latest
+            lipo: arm64
+          # Intel: built natively on an Intel runner, so npm ci, the native
+          # module rebuild and Electron are all x86_64.
+          - arch: x64
+            runner: macos-15-intel
+            lipo: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          architecture: ${{ matrix.arch }}
+          # No npm cache: nothing native is carried over between architectures.
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if [ "$RELEASE_TAG" != "v$PACKAGE_VERSION" ]; then
+            echo "Tag $RELEASE_TAG must match package.json version $PACKAGE_VERSION." >&2
+            exit 1
+          fi
+          echo "Runner $(uname -m), Node $(node -p process.arch), building ${{ matrix.arch }}"
+
+      # Fresh node_modules on this runner only.
+      - run: npm ci
+      - run: npm test
+
+      # Rebuild the encrypted SQLite driver for Electron (the version in
+      # package.json) and THIS architecture.
+      - name: Rebuild native modules for Electron ${{ matrix.arch }}
+        run: npx electron-builder install-app-deps --platform=darwin --arch=${{ matrix.arch }}
+
+      # No Apple certificate: unsigned, unnotarized DMG (right-click > Open the first time).
+      - name: Build the ${{ matrix.arch }} DMG
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run dist:mac:${{ matrix.arch }}
+
+      - name: Electron and better_sqlite3.node must both be ${{ matrix.lipo }}
+        shell: bash
+        run: |
+          APP=$(ls -d release/mac*/APE.app | head -1)
+          EXE="$APP/Contents/MacOS/APE"
+          NODE="$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node"
+          file "$EXE" "$NODE"
+          EXE_ARCH=$(lipo -archs "$EXE"); NODE_ARCH=$(lipo -archs "$NODE")
+          echo "Electron: $EXE_ARCH   better_sqlite3.node: $NODE_ARCH   expected: ${{ matrix.lipo }}"
+          if [ "$EXE_ARCH" != "${{ matrix.lipo }}" ] || [ "$NODE_ARCH" != "${{ matrix.lipo }}" ]; then
+            echo "::error::Architecture mismatch in the ${{ matrix.arch }} app (Electron $EXE_ARCH, better_sqlite3.node $NODE_ARCH, expected ${{ matrix.lipo }}). Not publishing." >&2
+            exit 1
+          fi
+          # The DMG itself: mount it and check the app inside, which is what users install.
+          DMG=$(ls release/APE-mac-${{ matrix.arch }}.dmg)
+          MNT=$(mktemp -d)
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
+          DMG_EXE=$(lipo -archs "$MNT/APE.app/Contents/MacOS/APE")
+          DMG_NODE=$(lipo -archs "$MNT/APE.app/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node")
+          hdiutil detach "$MNT" >/dev/null
+          echo "Inside $DMG: Electron $DMG_EXE, better_sqlite3.node $DMG_NODE"
+          if [ "$DMG_EXE" != "${{ matrix.lipo }}" ] || [ "$DMG_NODE" != "${{ matrix.lipo }}" ]; then
+            echo "::error::$DMG contains Electron $DMG_EXE with better_sqlite3.node $DMG_NODE (expected ${{ matrix.lipo }}). Not publishing." >&2
+            exit 1
+          fi
+
+      # Each job writes latest-mac.yml for its own DMG; publish-release merges
+      # the two so the update check sees both.
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          cp release/latest-mac.yml "release/latest-mac-${{ matrix.arch }}.yml"
+          gh release upload "$RELEASE_TAG" "release/APE-mac-${{ matrix.arch }}.dmg" "release/APE-mac-${{ matrix.arch }}.dmg.blockmap" \
+            "release/latest-mac-${{ matrix.arch }}.yml" --repo "${{ github.repository }}" --clobber
+
+  publish-release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge the macOS update files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --pattern 'latest-mac-*.yml' --dir mac
+          # Insert the arm64 entry into the x64 file's list of files.
+          node -e '
+            const fs = require("fs");
+            const x64 = fs.readFileSync("mac/latest-mac-x64.yml", "utf8"), arm = fs.readFileSync("mac/latest-mac-arm64.yml", "utf8");
+            const NL = String.fromCharCode(10);
+            const entries = s => s.slice(s.indexOf("files:" + NL) + 7, s.indexOf(NL + "path:")).trimEnd();
+            fs.writeFileSync("mac/latest-mac.yml", x64.replace(NL + "path:", NL + entries(arm) + NL + "path:"));
+          '
+          cat mac/latest-mac.yml
+          gh release upload "$RELEASE_TAG" mac/latest-mac.yml --repo "${{ github.repository }}" --clobber
+          gh release delete-asset "$RELEASE_TAG" latest-mac-x64.yml --repo "${{ github.repository }}" --yes
+          gh release delete-asset "$RELEASE_TAG" latest-mac-arm64.yml --repo "${{ github.repository }}" --yes
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest --repo "${{ github.repository }}"
