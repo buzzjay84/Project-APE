@@ -64,18 +64,38 @@ jobs:
     needs: check-tag
     runs-on: ubuntu-latest
     steps:
+      # The release notes are written in the private source as
+      # release-notes/vX.Y.Z.md (test/release-notes.test.js requires one for
+      # package.json's version). Only that folder is checked out.
+      - name: Read the release notes from the private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.PRIVATE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: release-notes
+          sparse-checkout-cone-mode: false
+
       - name: Create the one draft release all builds upload into
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
+          NOTES="release-notes/$RELEASE_TAG.md"
+          if [ ! -s "$NOTES" ]; then
+            echo "::error::$NOTES is missing or empty in the private source. Add it, push, then run: gh workflow run build-from-private.yml -R ${{ github.repository }} -f tag=$RELEASE_TAG -f ref=main" >&2
+            exit 1
+          fi
           if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
             echo "::error::$RELEASE_TAG is already published; bump the version for a new release." >&2
             exit 1
           elif gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Draft release $RELEASE_TAG exists; the builds will upload into it."
+            gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --notes-file "$NOTES"
+            echo "Draft release $RELEASE_TAG exists; notes updated, the builds will upload into it."
           else
-            gh release create "$RELEASE_TAG" --repo "${{ github.repository }}" --draft --title "${RELEASE_TAG#v}" --notes ""
+            gh release create "$RELEASE_TAG" --repo "${{ github.repository }}" --draft --title "${RELEASE_TAG#v}" --notes-file "$NOTES"
           fi
 
   build-windows:
