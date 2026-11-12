@@ -198,7 +198,7 @@ jobs:
         run: |
           APP=$(ls -d release/mac*/APE.app | head -1)
           EXE="$APP/Contents/MacOS/APE"
-          NODE="$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node"
+          NODE="$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/prebuilds/darwin-${{ matrix.arch }}.node"
           file "$EXE" "$NODE"
           EXE_ARCH=$(lipo -archs "$EXE"); NODE_ARCH=$(lipo -archs "$NODE")
           echo "Electron: $EXE_ARCH   better_sqlite3.node: $NODE_ARCH   expected: ${{ matrix.lipo }}"
@@ -211,7 +211,7 @@ jobs:
           MNT=$(mktemp -d)
           hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
           DMG_EXE=$(lipo -archs "$MNT/APE.app/Contents/MacOS/APE")
-          DMG_NODE=$(lipo -archs "$MNT/APE.app/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node")
+          DMG_NODE=$(lipo -archs "$MNT/APE.app/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/prebuilds/darwin-${{ matrix.arch }}.node")
           hdiutil detach "$MNT" >/dev/null
           echo "Inside $DMG: Electron $DMG_EXE, better_sqlite3.node $DMG_NODE"
           if [ "$DMG_EXE" != "${{ matrix.lipo }}" ] || [ "$DMG_NODE" != "${{ matrix.lipo }}" ]; then
