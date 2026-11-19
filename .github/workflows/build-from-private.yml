@@ -137,6 +137,17 @@ jobs:
         shell: bash
         run: gh release upload "$RELEASE_TAG" release/ape-setup-*.exe release/ape-setup-*.exe.blockmap release/latest.yml --repo "${{ github.repository }}" --clobber
 
+      # Implementing-unit edition: same code, its own installer and update
+      # channel (ui.yml), so a UI install never updates into the SDO edition.
+      - name: Build Windows installer (UI edition)
+        run: npm run dist:win:ui
+
+      - name: Upload UI edition to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" release/ape-ui-setup-*.exe release/ape-ui-setup-*.exe.blockmap release/ui.yml --repo "${{ github.repository }}" --clobber
+
   build-macos:
     needs: create-release
     strategy:
